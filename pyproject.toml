@@ -1,0 +1,8 @@
+[project]
+name = "plum-dispatch-race-repro"
+version = "0.0.0"
+requires-python = ">=3.13"
+dependencies = [
+    "plum-dispatch==2.9.0",
+    "beartype==0.22.9",
+]
