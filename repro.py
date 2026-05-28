@@ -120,6 +120,8 @@ def categorize(e: BaseException) -> str:
         return "plum.NotFoundLookupError (dispatch corrupted by partial resolve)"
     if isinstance(e, threading.BrokenBarrierError):
         return "BrokenBarrierError (siblings hung past barrier timeout)"
+    if isinstance(e, NameError) and "__beartype_object" in msg:
+        return 'NameError: "__beartype_object_<id> not defined" (is_bearable checker body/scope mismatch)'
     return f"other ({type(e).__name__}): {msg[:80]}"
 
 
@@ -129,6 +131,7 @@ def main() -> int:
     trials_with_errors = 0
     trials = 0
 
+    print(f"Running for {DURATION_S:.0f} seconds...", flush=True)
     start = time.monotonic()
     deadline = start + DURATION_S
     while time.monotonic() < deadline:
@@ -138,9 +141,12 @@ def main() -> int:
             trials_with_errors += 1
             for e in errors:
                 error_counts[categorize(e)] += 1
+            print(".", end="", flush=True)
         else:
             trials_clean += 1
     elapsed = time.monotonic() - start
+    if trials_with_errors:
+        print()
 
     print(f"Ran {trials} trials × {THREADS} threads in {elapsed:.1f}s")
     print(f"  clean trials:           {trials_clean}")
