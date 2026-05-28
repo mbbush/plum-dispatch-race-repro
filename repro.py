@@ -1,160 +1,159 @@
-"""Minimal reproducer for a thread-safety bug in plum-dispatch's lazy
-signature resolution.
+"""Reproducer for a thread-safety bug in plum-dispatch's lazy signature resolution.
 
-When multiple threads simultaneously trigger the first dispatch on a plum
-@dispatch function, two threads can both enter
-`Function._resolve_pending_registrations`, which iterates `self._pending`
-without removing entries. Each pending entry's signature is then resolved
-by `Signature.from_callable` -> `resolve_pep563` -> `beartype.peps.resolve_pep563`,
-which mutates the function's `__annotations__` in place. Concurrent calls
-on the same function can leave annotations in a partially-resolved state,
-tripping `beartype._check.forward.fwdresolve.resolve_hint`'s assertion:
+When multiple threads simultaneously make the *first* dispatch call on a
+plum @dispatch Function, two threads can both enter
+`Function._resolve_pending_registrations`. That method iterates
+`self._pending` without removing entries, so both threads call
+`Signature.from_callable(f)` on the same `f`, which calls
+`beartype.peps.resolve_pep563(f)`. resolve_pep563 mutates
+`f.__annotations__` in place, racing with the other thread's iteration.
 
-    AssertionError: <union> not stringified type hint.
+The race surfaces as one of several symptoms:
+  - AssertionError: "<hint> not stringified type hint."
+        (beartype's resolve_hint asserts on an already-resolved annotation)
+  - RuntimeError: "dictionary changed size during iteration"
+        (concurrent mutation of f.__annotations__)
+  - plum.NotFoundLookupError after a successful resolve
+        (dispatch table left in a corrupt state by a partial resolve)
 
-Observed in the wild as an intermittent CI failure.
+Each plum.Function only races on its *first* dispatch call, so this script
+generates fresh @dispatch functions and races a thread pool on each one's
+first call for DURATION_S seconds, then reports how many times each error
+category fired.
 
-This script generates many independent @dispatch functions and races a
-thread pool on the first call to each. The race only fires on the *first*
-call to a given Function (subsequent calls find a populated dispatch
-cache), so each generated function is one race trial. The trial count and
-function complexity are tuned to reliably reproduce at the default GIL
-switch interval (5 ms).
+Run:  uv pip install -e . && .venv/bin/python repro.py
 """
 
 from __future__ import annotations
 
 import sys
 import threading
+import time
 import types
-from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 
-N_TRIALS = 200    # independent @dispatch functions; each is one first-call race
-N_OVERLOADS = 20  # @overloads per function; widens _resolve_pending_registrations
-N_PARAMS = 8      # parameters per overload; widens per-resolve_pep563 mutation window
-N_UNION = 6       # union arms per parameter; widens per-resolve_hint work
-N_TYPES = 24      # bank of types to pick from
-N_THREADS = 32    # workers racing each first call
+THREADS = 32
+DURATION_S = 60.0
+
+# Source for one trial. Each trial uses its own Dispatcher() so its Function
+# is isolated from other trials (plum's module-level `dispatch` is a singleton
+# keyed by function name, so reusing `dispatch` across trials would share state).
+# Multiple wide-union methods make _resolve_pending_registrations slow enough
+# that the GIL is likely to preempt a resolving thread mid-mutation.
+TRIAL_SRC = """\
+from __future__ import annotations
+from plum import Dispatcher
+dispatcher = Dispatcher()
+
+class A: pass
+class B: pass
+class C: pass
+class D: pass
+class E: pass
+class F: pass
+class G: pass
+class H: pass
+
+@dispatcher
+def fn(x: A, y: A | B | C | D | E | F | G | H) -> A: return x
+@dispatcher
+def fn(x: B, y: A | B | C | D | E | F | G | H) -> B: return x
+@dispatcher
+def fn(x: C, y: A | B | C | D | E | F | G | H) -> C: return x
+@dispatcher
+def fn(x: D, y: A | B | C | D | E | F | G | H) -> D: return x
+@dispatcher
+def fn(x: E, y: A | B | C | D | E | F | G | H) -> E: return x
+@dispatcher
+def fn(x: F, y: A | B | C | D | E | F | G | H) -> F: return x
+@dispatcher
+def fn(x: G, y: A | B | C | D | E | F | G | H) -> G: return x
+@dispatcher
+def fn(x: H, y: A | B | C | D | E | F | G | H) -> H: return x
+"""
 
 
-def build_source() -> str:
-    """Generate source for N_TRIALS independent @dispatch functions.
+def make_trial(i: int) -> types.ModuleType:
+    """Compile TRIAL_SRC into a fresh module so its `fn` is a fresh plum.Function."""
+    mod = types.ModuleType(f"_plum_race_trial_{i}")
+    sys.modules[mod.__name__] = mod  # so beartype can resolve forward refs
+    exec(compile(TRIAL_SRC, mod.__name__, "exec"), mod.__dict__)
+    return mod
 
-    Each function has one narrow overload (matches the call args we use
-    below) plus N_OVERLOADS-1 wide overloads with multi-element unions.
-    The wide overloads are unreachable from our call site but sit in the
-    plum Function's _pending list and slow down signature resolution,
-    widening the race window.
+
+def race(mod: types.ModuleType) -> list[BaseException]:
+    """Fire THREADS workers at mod.fn's first call; return any exceptions raised.
+
+    mod.fn(A, B) matches the first method cleanly, so under correct
+    behavior all workers return without error.
     """
-    lines = [
-        "from __future__ import annotations",
-        "from typing import overload",
-        "from plum import dispatch",
-    ]
-    for i in range(N_TYPES):
-        lines.append(f"class T{i}: pass")
-    for trial in range(N_TRIALS):
-        name = f"fn_{trial}"
-        # Narrow overload: all params are T0; matches our test call.
-        narrow_params = ", ".join(f"p{p}: T0" for p in range(N_PARAMS))
-        lines += [
-            "@overload",
-            f"def {name}({narrow_params}) -> T0:",
-            "    return p0",
-        ]
-        # Wide overloads: rotating multi-element unions, unreachable from T0 args
-        # but expensive to resolve (more name lookups, more `|` operations).
-        for ov in range(1, N_OVERLOADS):
-            params = []
-            for p in range(N_PARAMS):
-                # Skip T0 so we don't accidentally match the narrow call
-                ts = [f"T{1 + (trial * 7 + ov * 3 + p * 5 + i) % (N_TYPES - 1)}"
-                      for i in range(N_UNION)]
-                params.append(f"p{p}: {' | '.join(ts)}")
-            ret_ts = [f"T{1 + (trial * 11 + ov * 5 + i) % (N_TYPES - 1)}"
-                      for i in range(N_UNION)]
-            lines += [
-                "@overload",
-                f"def {name}({', '.join(params)}) -> {' | '.join(ret_ts)}:",
-                "    return p0",
-            ]
-        sig = ", ".join(f"p{p}" for p in range(N_PARAMS))
-        lines += [
-            "@dispatch",
-            f"def {name}({sig}): ...",
-        ]
-    return "\n".join(lines)
-
-
-TRIAL_TIMEOUT_S = 5.0  # if a trial hangs longer than this, give up on it
-
-
-def race(executor: ThreadPoolExecutor, fn, arg) -> list[BaseException]:
-    """Fire N_THREADS threads at fn(arg, ...) simultaneously via a barrier.
-
-    Returns the list of exceptions raised by workers. Workers that
-    don't return within TRIAL_TIMEOUT_S are abandoned (race hit
-    + the broken plum.Function state can cause sibling threads to
-    deadlock; we accept the leak to keep progressing).
-    """
-    barrier = threading.Barrier(N_THREADS, timeout=TRIAL_TIMEOUT_S)
-    errs: list[BaseException] = []
+    barrier = threading.Barrier(THREADS, timeout=5.0)
+    errors: list[BaseException] = []
     lock = threading.Lock()
 
     def worker() -> None:
         try:
             barrier.wait()
-            fn(*[arg] * N_PARAMS)
+            mod.fn(mod.A(), mod.B())
         except BaseException as e:
             with lock:
-                errs.append(e)
+                errors.append(e)
 
-    futures = [executor.submit(worker) for _ in range(N_THREADS)]
-    for f in futures:
-        try:
-            f.result(timeout=TRIAL_TIMEOUT_S)
-        except TimeoutError:
-            pass  # leaked worker; the post-hit plum state is corrupt anyway
-    return errs
+    # Use fresh daemon threads per trial: a leaked worker from a corrupted
+    # plum state shouldn't starve future trials, and daemons exit cleanly
+    # with the process.
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(THREADS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+    return errors
 
 
-def is_race_assertion(e: BaseException) -> bool:
-    return isinstance(e, AssertionError) and "stringified type hint" in str(e)
+def categorize(e: BaseException) -> str:
+    msg = str(e)
+    if isinstance(e, AssertionError) and "stringified type hint" in msg:
+        return 'AssertionError: "<hint> not stringified type hint."'
+    if isinstance(e, RuntimeError) and "dictionary changed size" in msg:
+        return 'RuntimeError: "dictionary changed size during iteration"'
+    if type(e).__name__ == "NotFoundLookupError":
+        return "plum.NotFoundLookupError (dispatch corrupted by partial resolve)"
+    if isinstance(e, threading.BrokenBarrierError):
+        return "BrokenBarrierError (siblings hung past barrier timeout)"
+    return f"other ({type(e).__name__}): {msg[:80]}"
 
 
 def main() -> int:
-    print(f"compiling {N_TRIALS} trial functions...", flush=True)
-    mod = types.ModuleType("plum_race_trials")
-    sys.modules[mod.__name__] = mod
-    exec(compile(build_source(), "plum_race_trials.py", "exec"), mod.__dict__)
-    ns = mod.__dict__
-    arg = ns["T0"]()
-    print(f"running up to {N_TRIALS} trials × {N_THREADS} threads "
-          f"(default switch interval, stop on first hit)...", flush=True)
+    error_counts: Counter[str] = Counter()
+    trials_clean = 0
+    trials_with_errors = 0
+    trials = 0
 
-    # One shared pool — creating/tearing down N_TRIALS executors is wasteful.
-    with ThreadPoolExecutor(max_workers=N_THREADS) as executor:
-        for trial in range(N_TRIALS):
-            fn = ns[f"fn_{trial}"]
-            errs = race(executor, fn, arg)
-            race_errs = [e for e in errs if is_race_assertion(e)]
-            if race_errs:
-                e = race_errs[0]
-                print(f"trial {trial}: REPRODUCED "
-                      f"({len(race_errs)}/{N_THREADS} threads tripped assertion)",
-                      flush=True)
-                print(f"  {type(e).__name__}: {e}", flush=True)
-                return 1
-            other = [e for e in errs if not is_race_assertion(e)]
-            if other:
-                # First trial's dispatch had unrelated errors -> bug in test setup
-                print(f"trial {trial}: {len(other)} unrelated errors, e.g. "
-                      f"{type(other[0]).__name__}: {other[0]!r}", flush=True)
-                return 2
-            if (trial + 1) % 10 == 0:
-                print(f"  {trial + 1} trials clean", flush=True)
-    print(f"no race observed across {N_TRIALS} trials", flush=True)
-    return 0
+    start = time.monotonic()
+    deadline = start + DURATION_S
+    while time.monotonic() < deadline:
+        errors = race(make_trial(trials))
+        trials += 1
+        if errors:
+            trials_with_errors += 1
+            for e in errors:
+                error_counts[categorize(e)] += 1
+        else:
+            trials_clean += 1
+    elapsed = time.monotonic() - start
+
+    print(f"Ran {trials} trials × {THREADS} threads in {elapsed:.1f}s")
+    print(f"  clean trials:           {trials_clean}")
+    print(f"  trials with >=1 error:  {trials_with_errors}")
+    print()
+    if error_counts:
+        total = sum(error_counts.values())
+        print(f"Errors across all workers ({total} total):")
+        for cat, n in error_counts.most_common():
+            print(f"  {n:>6}  {cat}")
+    else:
+        print("No errors observed.")
+    return 0 if error_counts else 1
 
 
 if __name__ == "__main__":
