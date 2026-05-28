@@ -1,5 +1,7 @@
 # plum-dispatch race condition reproducer
 
+Upstream repo: [beartype/plum](https://github.com/beartype/plum)
+
 `plum-dispatch`'s lazy signature resolution is not thread-safe. When two
 worker threads simultaneously make the *first* dispatch call on a
 `@dispatch` Function, concurrent mutation of the function's
